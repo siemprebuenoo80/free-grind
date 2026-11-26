@@ -1,0 +1,93 @@
+name: Build 32-bit APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-arm32.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare 32-bit build
+        shell: python
+        run: |
+          from pathlib import Path
+
+          dockerfile = Path("ci/build/Dockerfile")
+          text = dockerfile.read_text()
+          assert "rustup target add aarch64-linux-android" in text
+          text = text.replace(
+              "rustup target add aarch64-linux-android",
+              "rustup target add armv7-linux-androideabi"
+          )
+          dockerfile.write_text(text)
+
+          script = Path("ci/build/android.sh")
+          text = script.read_text()
+          assert "--target aarch64" in text
+          text = text.replace("--target aarch64", "--target armv7")
+          text = text.replace("/apk/arm64/", "/apk/arm/")
+          script.write_text(text)
+
+      - name: Build APK
+        env:
+          FG_CHANNEL: development
+          FG_CONTAINER_ENGINE: docker
+        run: sh ci/build/run.sh android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Sign and check APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "build-tools;36.0.0"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/test.jks" \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Personal Test"
+
+          files=(out/android/*-unsigned.apk)
+          test "${#files[@]}" -eq 1
+          mkdir -p output
+
+          "$tools/zipalign" -f -p 4 \
+            "${files[0]}" "$RUNNER_TEMP/aligned.apk"
+
+          "$tools/apksigner" sign \
+            --ks "$RUNNER_TEMP/test.jks" \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out output/free-grind-arm32.apk \
+            "$RUNNER_TEMP/aligned.apk"
+
+          "$tools/apksigner" verify output/free-grind-arm32.apk
+
+          unzip -l output/free-grind-arm32.apk \
+            | grep 'lib/armeabi-v7a/.*\.so'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: free-grind-arm32
+          path: output/free-grind-arm32.apk
+          if-no-files-found: error
